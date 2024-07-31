@@ -115,6 +115,22 @@ impl<'d, T: Instance> SpiSlave<'d, T> {
         )
     }
 
+    /// Create a new SPI Slave driver, in RX only mode (only MOSI, no MISO)
+    pub fn new_rxonly(
+        peri: impl Peripheral<P = T> + 'd,
+        sck: impl Peripheral<P = impl SckPin<T>> + 'd,
+        mosi: impl Peripheral<P = impl MosiPin<T>> + 'd,
+        config: Config,
+    ) -> Self
+    {
+        into_ref!(peri, sck, mosi);
+
+        sck.set_as_af(sck.af_num(), AfType::input(Pull::None));
+        mosi.set_as_af(mosi.af_num(), AfType::input(Pull::None));
+
+        Self::new_inner(peri, Some(sck.map_into()), Some(mosi.map_into()), None, None, config)
+    }
+
     fn new_inner(
         peri: impl Peripheral<P = T> + 'd,
         sck: Option<PeripheralRef<'d, AnyPin>>,

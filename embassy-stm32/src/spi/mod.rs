@@ -49,10 +49,13 @@ pub enum BitOrder {
 pub struct Config {
     /// SPI mode.
     pub mode: Mode,
+
     /// Bit order.
     pub bit_order: BitOrder,
+
     /// Clock frequency.
     pub frequency: Hertz,
+
     /// Enable internal pullup on MISO.
     ///
     /// There are some ICs that require a pull-up on the MISO pin for some applications.
