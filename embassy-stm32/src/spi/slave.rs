@@ -128,7 +128,14 @@ impl<'d, T: Instance> SpiSlave<'d, T> {
         sck.set_as_af(sck.af_num(), AfType::input(Pull::None));
         mosi.set_as_af(mosi.af_num(), AfType::input(Pull::None));
 
-        Self::new_inner(peri, Some(sck.map_into()), Some(mosi.map_into()), None, None, config)
+        Self::new_inner(
+            peri,
+            Some(sck.map_into()),
+            Some(mosi.map_into()),
+            None,
+            None,
+            config
+        )
     }
 
     fn new_inner(
@@ -190,16 +197,30 @@ impl<'d, T: Instance> SpiSlave<'d, T> {
         }
         #[cfg(any(spi_v3, spi_v4, spi_v5))]
         {
+
             regs.ifcr().write(|w| w.0 = 0xffff_ffff);
             regs.cfg2().modify(|w| {
                 w.set_cpha(cpha);
                 w.set_cpol(cpol);
                 w.set_lsbfirst(lsbfirst);
+                w.set_ioswp(false);
 
                 w.set_master(vals::Master::SLAVE);
-                w.set_ssm(false);
+                w.set_ssm(cs.is_none());
 
-                w.set_comm(vals::Comm::FULLDUPLEX);
+                // TODO: map all options
+                w.set_comm(if mosi.is_none() || miso.is_none() {
+                    vals::Comm::RECEIVER
+                } else {
+                    vals::Comm::FULLDUPLEX
+                });
+
+                w.set_rdiom(if cs.is_none() {
+                    vals::Rdiom::PERMANENTLYACTIVE
+                } else {
+                    vals::Rdiom::FROMINPUT
+                });
+
                 w.set_ssom(vals::Ssom::ASSERTED);
                 w.set_midi(0);
                 w.set_mssi(0);
@@ -215,7 +236,8 @@ impl<'d, T: Instance> SpiSlave<'d, T> {
                 w.set_tsize(0);
             });
             regs.cr1().modify(|w| {
-                w.set_ssi(false);
+                w.set_ssi(defmt::dbg!(cs.is_none()));
+                w.set_hddir(vals::Hddir::RECEIVER);
             });
         }
 
@@ -334,6 +356,7 @@ impl<'d, T: Instance> SpiSlave<'d, T> {
         self.info.regs.cr1().modify(|w| w.set_spe(true));
         self.set_word_size(W::CONFIG);
 
+        // TODO: add check for assymetric use?
         let _ = transfer_word(self.info.regs, word)?;
 
         Ok(())
@@ -344,7 +367,19 @@ impl<'d, T: Instance> SpiSlave<'d, T> {
         self.info.regs.cr1().modify(|w| w.set_spe(true));
         self.set_word_size(W::CONFIG);
 
-        transfer_word(self.info.regs, W::default())
+        if self.miso.is_none() {
+            if !rx_ready(self.info.regs)? {
+                return Err(nb::Error::WouldBlock);
+            }
+
+            #[cfg(any(spi_v3, spi_v4, spi_v5))]
+            self.info.regs.cr1().modify(|reg| reg.set_cstart(true));
+
+            let rx_word = unsafe { ptr::read_volatile(self.info.regs.rx_ptr()) };
+            Ok(rx_word)
+        } else {
+            transfer_word(self.info.regs, W::default())
+        }
     }
 
     /// Bidirectionally transfer by writing a word to SPI while simultaneously reading a word from
