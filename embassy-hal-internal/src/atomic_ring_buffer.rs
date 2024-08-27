@@ -237,7 +237,7 @@ impl<'a> Writer<'a> {
         }
         let n = if start > end { start - end } else { len - end };
 
-        trace!("  ringbuf: push_buf {:?}..{:?}", end, end + n);
+        // trace!("  ringbuf: push_buf {:?}..{:?}", end, end + n);
         (unsafe { buf.add(end) }, n)
     }
 
@@ -276,13 +276,13 @@ impl<'a> Writer<'a> {
         let n0 = if start > end { start - end } else { len - end };
         let n1 = if start <= end { start } else { 0 };
 
-        trace!("  ringbuf: push_bufs [{:?}..{:?}, {:?}..{:?}]", end, end + n0, 0, n1);
+        // trace!("  ringbuf: push_bufs [{:?}..{:?}, {:?}..{:?}]", end, end + n0, 0, n1);
         [(unsafe { buf.add(end) }, n0), (buf, n1)]
     }
 
     /// Mark n bytes as written and advance the write index.
     pub fn push_done(&mut self, n: usize) {
-        trace!("  ringbuf: push {:?}", n);
+        // trace!("  ringbuf: push {:?}", n);
         let end = self.0.end.load(Ordering::Relaxed);
 
         // Ordering: write `end` last, with Release ordering.
@@ -362,13 +362,13 @@ impl<'a> Reader<'a> {
 
         let n = if end > start { end - start } else { len - start };
 
-        trace!("  ringbuf: pop_buf {:?}..{:?}", start, start + n);
+        // trace!("  ringbuf: pop_buf {:?}..{:?}", start, start + n);
         (unsafe { buf.add(start) }, n)
     }
 
     /// Mark n bytes as read and allow advance the read index.
     pub fn pop_done(&mut self, n: usize) {
-        trace!("  ringbuf: pop {:?}", n);
+        // trace!("  ringbuf: pop {:?}", n);
 
         let start = self.0.start.load(Ordering::Relaxed);
 
