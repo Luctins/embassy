@@ -8,7 +8,7 @@ use core::task::{Context, Poll, Waker};
 use embassy_hal_internal::{into_ref, Peripheral, PeripheralRef};
 use embassy_sync::waitqueue::AtomicWaker;
 
-use super::ringbuffer::{DmaCtrl, ReadableDmaRingBuffer, WritableDmaRingBuffer, Error};
+use super::ringbuffer::{WritableDmaRingBuffer, DmaCtrl, ReadableDmaRingBuffer, self};
 use super::word::{Word, WordSize};
 use super::{AnyChannel, Channel, Dir, Request, STATE};
 use crate::interrupt::typelevel::Interrupt;
@@ -19,6 +19,8 @@ use crate::pac::gpdma::vals;
 pub(crate) struct ChannelInfo {
     pub(crate) dma: pac::gpdma::Gpdma,
     pub(crate) num: usize,
+    #[cfg(feature = "_dual-core")]
+    pub(crate) irq: pac::Interrupt,
 }
 
 /// GPDMA transfer options.
@@ -62,6 +64,7 @@ pub(crate) unsafe fn init(cs: critical_section::CriticalSection, irq_priority: P
     foreach_interrupt! {
         ($peri:ident, gpdma, $block:ident, $signal_name:ident, $irq:ident) => {
             crate::interrupt::typelevel::$irq::set_priority_with_cs(cs, irq_priority);
+            #[cfg(not(feature = "_dual-core"))]
             crate::interrupt::typelevel::$irq::enable();
         };
     }
@@ -72,6 +75,12 @@ impl AnyChannel {
     /// Safety: Must be called with a matching set of parameters for a valid dma channel
     pub(crate) unsafe fn on_irq(&self) {
         let info = self.info();
+        #[cfg(feature = "_dual-core")]
+        {
+            use embassy_hal_internal::interrupt::InterruptExt as _;
+            info.irq.enable();
+        }
+
         let state = &STATE[self.id as usize];
 
         let ch = info.dma.ch(info.num);
@@ -92,31 +101,9 @@ impl AnyChannel {
             );
         }
 
-        if sr.htf() {
-            //clear the flag for the half transfer complete
-            ch.fcr().modify(|w| w.set_htf(true));
-            state.waker.wake();
-        }
-
-        if sr.tcf() {
-            //clear the flag for the transfer complete
-            ch.fcr().modify(|w| w.set_tcf(true));
-            state.complete_count.fetch_add(1, Ordering::Relaxed);
-            state.waker.wake();
-            return;
-        }
-
-        if sr.suspf() {
-            ch.fcr().modify(|w| w.set_suspf(true));
-
+        if sr.suspf() || sr.tcf() {
             // disable all xxIEs to prevent the irq from firing again.
-            ch.cr().modify(|w| {
-                w.set_tcie(false);
-                w.set_useie(false);
-                w.set_dteie(false);
-                w.set_suspie(false);
-                w.set_htie(false);
-            });
+            ch.cr().write(|_| {});
 
             // Wake the future. It'll look at tcf and see it's set.
             state.waker.wake();
@@ -124,12 +111,12 @@ impl AnyChannel {
     }
 }
 
-
 /// DMA transfer.
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct Transfer<'a> {
     channel: PeripheralRef<'a, AnyChannel>,
 }
+
 impl<'a> Transfer<'a> {
     /// Create a new read DMA transfer (peripheral to memory).
     pub unsafe fn new_read<W: Word>(
@@ -234,7 +221,10 @@ impl<'a> Transfer<'a> {
         data_size: WordSize,
         _options: TransferOptions,
     ) -> Self {
-        assert!(mem_len > 0 && mem_len <= 0xFFFF);
+        // BNDT is specified as bytes, not as number of transfers.
+        let Ok(bndt) = (mem_len * data_size.bytes()).try_into() else {
+            panic!("DMA transfers may not be larger than 65535 bytes.");
+        };
 
         let info = channel.info();
         let ch = info.dma.ch(info.num);
@@ -243,9 +233,6 @@ impl<'a> Transfer<'a> {
         fence(Ordering::SeqCst);
 
         let this = Self { channel };
-
-        #[cfg(dmamux)]
-        super::dmamux::configure_dmamux(&*this.channel, request);
 
         ch.cr().write(|w| w.set_reset(true));
         ch.fcr().write(|w| w.0 = 0xFFFF_FFFF); // clear all irqs
@@ -263,10 +250,8 @@ impl<'a> Transfer<'a> {
             });
             w.set_reqsel(request);
         });
-        ch.br1().write(|w| {
-            // BNDT is specified as bytes, not as number of transfers.
-            w.set_bndt((mem_len * data_size.bytes()) as u16)
-        });
+        ch.tr3().write(|_| {}); // no address offsets.
+        ch.br1().write(|w| w.set_bndt(bndt));
 
         match dir {
             Dir::MemoryToPeripheral => {
@@ -334,6 +319,7 @@ impl<'a> Transfer<'a> {
         core::mem::forget(self);
     }
 }
+
 impl<'a> Drop for Transfer<'a> {
     fn drop(&mut self) {
         self.request_stop();
@@ -343,6 +329,7 @@ impl<'a> Drop for Transfer<'a> {
         fence(Ordering::SeqCst);
     }
 }
+
 impl<'a> Unpin for Transfer<'a> {}
 impl<'a> Future for Transfer<'a> {
     type Output = ();
@@ -582,7 +569,7 @@ impl<'a, W: Word> ReadableRingBuffer<'a, W> {
     /// The length remaining is the capacity, ring_buf.len(), less the elements remaining after the
     /// read
     /// Error is returned if the portion to be read was overwritten by the DMA controller.
-    pub fn read(&mut self, buf: &mut [W]) -> Result<(usize, usize), Error> {
+    pub fn read(&mut self, buf: &mut [W]) -> Result<(usize, usize), ringbuffer::Error> {
         self.ringbuf.read(
             &mut DmaCtrlImpl {
                 channel: self.channel.reborrow(),
@@ -603,7 +590,7 @@ impl<'a, W: Word> ReadableRingBuffer<'a, W> {
     /// ring buffer was created with a buffer of size 'N':
     /// - If M equals N/2 or N/2 divides evenly into M, this function will return every N/2 elements read on the DMA source.
     /// - Otherwise, this function may need up to N/2 extra elements to arrive before returning.
-    pub async fn read_exact(&mut self, buffer: &mut [W]) -> Result<usize, Error> {
+    pub async fn read_exact(&mut self, buffer: &mut [W]) -> Result<usize, ringbuffer::Error> {
         self.ringbuf
             .read_exact(
                 &mut DmaCtrlImpl {
@@ -708,7 +695,7 @@ impl<'a, W: Word> WritableRingBuffer<'a, W> {
 
     /// Write elements directly to the raw buffer.
     /// This can be used to fill the buffer before starting the DMA transfer.
-    pub fn write_immediate(&mut self, buf: &[W]) -> Result<(usize, usize), Error> {
+    pub fn write_immediate(&mut self, buf: &[W]) -> Result<(usize, usize), ringbuffer::Error> {
         self.ringbuf.write_immediate(buf)
     }
 
@@ -722,7 +709,7 @@ impl<'a, W: Word> WritableRingBuffer<'a, W> {
 
     /// Write elements from the ring buffer
     /// Return a tuple of the length written and the length remaining in the buffer
-    pub fn write(&mut self, buf: &[W]) -> Result<(usize, usize), Error> {
+    pub fn write(&mut self, buf: &[W]) -> Result<(usize, usize), ringbuffer::Error> {
         self.ringbuf.write(
             &mut DmaCtrlImpl {
                 channel: self.channel.reborrow(),
@@ -733,7 +720,7 @@ impl<'a, W: Word> WritableRingBuffer<'a, W> {
     }
 
     /// Write an exact number of elements to the ringbuffer.
-    pub async fn write_exact(&mut self, buffer: &[W]) -> Result<usize, Error> {
+    pub async fn write_exact(&mut self, buffer: &[W]) -> Result<usize, ringbuffer::Error> {
         self.ringbuf
             .write_exact(
                 &mut DmaCtrlImpl {
